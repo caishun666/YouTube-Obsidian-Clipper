@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YouTube Obsidian Clipper</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">YT</div>
+        <div>
+          <h1>YouTube → Obsidian</h1>
+          <p class="sub">从当前视频页抓取信息并写入笔记</p>
+        </div>
+      </div>
+      <button id="btnOptions" class="icon-btn" title="设置">⚙</button>
+    </header>
+
+    <main class="main">
+      <section class="card status-card" id="statusCard">
+        <div class="status-line">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">准备就绪</span>
+        </div>
+        <p class="muted" id="videoHint">请先打开一个 YouTube 视频页面</p>
+      </section>
+
+      <section class="card">
+        <h2>抓取范围</h2>
+        <div class="checks">
+          <label><input type="checkbox" id="optTranscript" checked /> 全文转录</label>
+          <label><input type="checkbox" id="optComments" checked /> 前 100 条评论</label>
+          <label><input type="checkbox" id="optChapterThumbs" checked /> 章节缩略图</label>
+          <label><input type="checkbox" id="optThumbnail" checked /> 封面图片</label>
+        </div>
+        <label class="field">
+          <span>评论条数</span>
+          <input type="number" id="optCommentLimit" min="1" max="200" value="100" />
+        </label>
+      </section>
+
+      <section class="card">
+        <h2>笔记预览</h2>
+        <dl class="preview" id="preview">
+          <div><dt>标题</dt><dd id="pvTitle">—</dd></div>
+          <div><dt>链接</dt><dd id="pvUrl">—</dd></div>
+          <div><dt>播放量</dt><dd id="pvViews">—</dd></div>
+          <div><dt>发布</dt><dd id="pvPublished">—</dd></div>
+          <div><dt>章节</dt><dd id="pvChapters">—</dd></div>
+          <div><dt>转录</dt><dd id="pvTranscript">—</dd></div>
+          <div><dt>评论</dt><dd id="pvComments">—</dd></div>
+        </dl>
+      </section>
+
+      <button id="btnExtract" class="btn primary">抓取当前页面</button>
+      <button id="btnSave" class="btn accent" disabled>写入 Obsidian 笔记</button>
+
+      <div id="log" class="log" hidden></div>
+    </main>
+
+    <footer class="footer">
+      <span>Local REST API · 本地写入</span>
+      <a href="options.html" target="_blank" rel="noopener">设置</a>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

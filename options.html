@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YouTube Obsidian Clipper 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Chrome 扩展设置</p>
+          <h1>YouTube → Obsidian Clipper</h1>
+          <p class="lead">
+            从当前打开的 YouTube 视频页面抓取标题、简介、章节、字幕与评论，
+            经 Local REST API 写入 Obsidian 笔记库。
+          </p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>Obsidian Local REST API</h2>
+        <p class="hint">
+          安装社区插件 <strong>Local REST API</strong>，在插件设置中复制 API Key。
+          推荐启用 <em>HTTP Server</em>（默认 <code>http://127.0.0.1:27123</code>），
+          避免 Chrome 拦截自签 HTTPS 证书。
+        </p>
+        <div class="grid">
+          <label class="field">
+            <span>API 地址</span>
+            <input id="obsidianApiBaseUrl" type="text" placeholder="http://127.0.0.1:27123" />
+          </label>
+          <label class="field">
+            <span>API Key</span>
+            <input id="obsidianApiKey" type="password" placeholder="Bearer Token" autocomplete="off" />
+          </label>
+        </div>
+        <div class="row">
+          <button id="btnTest" class="btn ghost">测试连接</button>
+          <span id="testResult" class="test-result"></span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>笔记目录与命名</h2>
+        <div class="grid">
+          <label class="field">
+            <span>笔记目录（库内路径）</span>
+            <input id="noteFolder" type="text" placeholder="Clippings/YouTube" />
+          </label>
+          <label class="field">
+            <span>附件目录（封面/章节图）</span>
+            <input id="assetFolder" type="text" placeholder="Clippings/YouTube/assets" />
+          </label>
+          <label class="field wide">
+            <span>封面命名格式</span>
+            <input id="coverNameTemplate" type="text" placeholder="{{videoId}}-cover" />
+          </label>
+          <label class="field wide">
+            <span>笔记命名格式</span>
+            <input id="noteNameTemplate" type="text" placeholder="视频-{{seq2}}" />
+          </label>
+        </div>
+        <p class="hint">
+          可用变量：
+          <code>{{title}}</code>
+          <code>{{videoId}}</code>
+          <code>{{channel}}</code>
+          <code>{{date}}</code>
+          <code>{{datetime}}</code>
+          <code>{{views}}</code>
+          <code>{{duration}}</code>
+          <code>{{published}}</code>
+          <code>{{seq}}</code>
+          <code>{{seq2}}</code>
+          <code>{{seq:N}}</code>
+        </p>
+        <p class="hint">
+          序号按目标目录内已有笔记自动递增。写成
+          <code>视频-{{seq2}}</code>
+          得到
+          <code>视频-01</code>、<code>视频-02</code>；
+          <code>{{seq}}</code> 为不补零（1、2、3），
+          <code>{{seq:3}}</code> 为 001。
+        </p>
+        <p class="hint">其他示例：<code>{{date}} - {{title}}</code>、<code>{{channel}}-{{seq2}}-{{title}}</code></p>
+        <p class="hint">
+          封面命名可用同上变量。示例：
+          <code>{{videoId}}-cover</code>
+          →
+          <code>abc123-cover.jpg</code>；
+          <code>{{seq2}}-{{title}}</code>
+          →
+          <code>01-标题.jpg</code>
+          （扩展名自动按图片格式补）。
+        </p>
+      </section>
+
+      <section class="panel">
+        <h2>抓取内容</h2>
+        <div class="checks">
+          <label><input type="checkbox" id="includeThumbnail" /> 视频封面图片（下载到本地附件）</label>
+          <label><input type="checkbox" id="includeDescription" /> 视频简介</label>
+          <label><input type="checkbox" id="includeChapters" /> 视频章节信息</label>
+          <label><input type="checkbox" id="includeHashtags" /> 简介中的标签</label>
+          <label><input type="checkbox" id="includeChapterThumbs" /> 章节缩略图</label>
+          <label><input type="checkbox" id="includeTranscript" /> 内容转文字全文</label>
+          <label><input type="checkbox" id="includeComments" /> 评论（按热度，折叠算一条）</label>
+        </div>
+        <div class="grid">
+          <label class="field">
+            <span>评论条数上限</span>
+            <input id="commentLimit" type="number" min="1" max="200" />
+          </label>
+          <label class="field">
+            <span>默认标签（逗号分隔）</span>
+            <input id="defaultTags" type="text" placeholder="youtube, clipping" />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>字段说明</h2>
+        <ul class="fields-doc">
+          <li><strong>标题 / 链接 / 播放量 / 发布日期</strong>：从页面数据与 DOM 读取</li>
+          <li><strong>视频封面</strong>：下载图片写入附件目录，并在笔记中用 <code>![[...]]</code> 嵌入</li>
+          <li><strong>视频标签</strong>：页面 keywords + 简介 hashtag</li>
+          <li><strong>章节</strong>：时间戳章节 + 可选章节缩略图</li>
+          <li><strong>转录</strong>：点击页面「显示文稿」后从 DOM 提取；无字幕时为空</li>
+          <li><strong>评论</strong>：滚动评论区加载，按热度取前 N 条；每条主题（含折叠回复）算一条</li>
+          <li><strong>视频本体</strong>：暂不自动下载，请手动保存后自行链接</li>
+        </ul>
+      </section>
+
+      <div class="actions">
+        <button id="btnSave" class="btn primary">保存设置</button>
+        <span id="saveResult" class="save-result"></span>
+      </div>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
