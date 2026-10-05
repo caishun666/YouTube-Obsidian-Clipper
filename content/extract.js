@@ -1274,75 +1274,296 @@
     };
   }
 
-  function extractBasicInfo() {
-    const player = parseJsonFromPage("ytInitialPlayerResponse");
-    const data = parseJsonFromPage("ytInitialData");
-    const videoId = getVideoId();
-    const details = player?.videoDetails || {};
-    const micro =
-      player?.microformat?.playerMicroformatRenderer ||
-      deepFind(player || {}, "playerMicroformatRenderer") ||
-      {};
+  /** 从主世界取「当前」player/data；SPA 切页后 HTML 内嵌 JSON 会是上一个视频 */
+  function loadPageJsonLive(currentVideoId) {
+    const bridgeId = "__ytObsidianPageJsonBridge";
+    document.getElementById(bridgeId)?.remove();
+    const el = document.createElement("pre");
+    el.id = bridgeId;
+    el.hidden = true;
+    el.style.display = "none";
+    document.documentElement.appendChild(el);
 
-    // DOM 兜底
+    const s = document.createElement("script");
+    s.textContent = `
+      (function () {
+        var payload = { player: null, playerVideoId: null, micro: null };
+        try {
+          var p = window.ytInitialPlayerResponse;
+          if (p && p.videoDetails) {
+            payload.playerVideoId = p.videoDetails.videoId || null;
+            var d = p.videoDetails || {};
+            var mf = (p.microformat && p.microformat.playerMicroformatRenderer) || {};
+            payload.player = {
+              videoDetails: {
+                videoId: d.videoId,
+                title: d.title,
+                lengthSeconds: d.lengthSeconds,
+                keywords: d.keywords || [],
+                channelId: d.channelId,
+                shortDescription: d.shortDescription,
+                viewCount: d.viewCount,
+                author: d.author,
+                thumbnail: d.thumbnail,
+                isLiveContent: d.isLiveContent
+              }
+            };
+            payload.micro = {
+              publishDate: mf.publishDate || "",
+              uploadDate: mf.uploadDate || "",
+              category: mf.category || "",
+              ownerChannelName: mf.ownerChannelName || "",
+              externalChannelId: mf.externalChannelId || "",
+              lengthSeconds: mf.lengthSeconds
+            };
+          }
+        } catch (e) {}
+        var el = document.getElementById("__ytObsidianPageJsonBridge");
+        if (el) el.textContent = JSON.stringify(payload);
+      })();
+    `;
+    document.documentElement.appendChild(s);
+    s.remove();
+
+    let out = null;
+    try {
+      out = JSON.parse(el.textContent || "null");
+    } catch (_) {
+      out = null;
+    }
+    el.remove();
+
+    const player = out?.player || null;
+    const playerVideoId = out?.playerVideoId || player?.videoDetails?.videoId || null;
+
+    if (currentVideoId && playerVideoId && playerVideoId !== currentVideoId) {
+      return { player: null, micro: null, stale: true, playerVideoId };
+    }
+    return {
+      player,
+      micro: out?.micro || null,
+      stale: !player,
+      playerVideoId,
+    };
+  }
+
+  /** 从简介区「次观看 / 发布日」文案解析 */
+  function parseViewsAndDateFromDom() {
+    const blobs = [];
+    const pushText = (el) => {
+      if (!el) return;
+      const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (t && t.length <= 400) blobs.push(t);
+    };
+
+    // 整块信息区 + 简介头 + 简介全文
+    [
+      "#info",
+      "ytd-watch-info-text",
+      "ytd-watch-info-text #info",
+      "#description-inline-expander",
+      "ytd-text-inline-expander#description-inline-expander",
+      "ytd-video-description-header-renderer",
+      "ytd-watch-metadata #info",
+      "#description",
+    ].forEach((sel) => {
+      document.querySelectorAll(sel).forEach(pushText);
+    });
+
+    let views = null;
+    let published = "";
+
+    for (const t of blobs) {
+      if (views == null) {
+        const m =
+          t.match(/([\d][\d,.]*)\s*(万|亿)?\s*(次观看|views?)/i) ||
+          t.match(/(次观看|views?)\s*([\d][\d,.]*)\s*(万|亿)?/i);
+        if (m) {
+          const numRaw = m[1] && /[\d]/.test(m[1]) ? m[1] : m[2];
+          const unit = m[0].includes("万") ? "万" : m[0].includes("亿") ? "亿" : "";
+          let n = Number(String(numRaw).replace(/,/g, ""));
+          if (unit === "万") n = Math.round(n * 10000);
+          if (unit === "亿") n = Math.round(n * 100000000);
+          if (Number.isFinite(n) && n > 0) views = n;
+        }
+      }
+      if (!published) {
+        const cn = t.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+        if (cn) {
+          published = `${cn[1]}-${String(cn[2]).padStart(2, "0")}-${String(cn[3]).padStart(2, "0")}`;
+        } else {
+          const iso = t.match(/(\d{4}-\d{2}-\d{2})/);
+          if (iso) published = iso[1];
+          else {
+            const en = t.match(
+              /([A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4})/
+            );
+            if (en) published = en[1];
+          }
+        }
+      }
+    }
+
+    // 再从正文简介里的日期补一次
+    if (!published) {
+      const desc = (document.querySelector("#description-inline-expander, #description")?.innerText || "");
+      const cn = desc.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+      if (cn) {
+        published = `${cn[1]}-${String(cn[2]).padStart(2, "0")}-${String(cn[3]).padStart(2, "0")}`;
+      }
+    }
+
+    return { views, published };
+  }
+
+  function parseDurationFromDom() {
+    const el = document.querySelector(
+      ".ytp-time-duration, ytd-player .ytp-time-duration, span.ytp-time-duration"
+    );
+    const t = (el?.textContent || "").trim();
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) return t;
+    return "";
+  }
+
+  function parseChannelIdFromDom() {
+    // 1) 经典 /channel/UC...
+    const a1 = document.querySelector(
+      '#channel-name a[href*="/channel/"], #owner a[href*="/channel/"], ytd-channel-name a[href*="/channel/"], #avatar-section a[href*="/channel/"]'
+    );
+    const href1 = a1?.getAttribute("href") || "";
+    const m1 = href1.match(/\/channel\/(UC[\w-]+)/);
+    if (m1) return m1[1];
+
+    // 2) 只有 @handle 时，从页内 JSON 取 channelId；再不行存 handle 便于识别
+    const handleA = document.querySelector(
+      '#channel-name a[href^="/@"], #owner a[href^="/@"], ytd-channel-name a[href^="/@"]'
+    );
+    const href2 = handleA?.getAttribute("href") || "";
+    const m2 = href2.match(/\/@([\w.-]+)/);
+    try {
+      const live = loadPageJsonLive(getVideoId());
+      const cid = live?.player?.videoDetails?.channelId || live?.micro?.externalChannelId;
+      if (cid) return cid;
+    } catch (_) {
+      /* ignore */
+    }
+    return m2 ? `@${m2[1]}` : "";
+  }
+
+  function extractBasicInfo() {
+    const videoId = getVideoId();
+
+    // 1) 主世界当前值（优先）
+    let live = { player: null, micro: null, stale: true };
+    try {
+      live = loadPageJsonLive(videoId);
+    } catch (_) {
+      live = { player: null, micro: null, stale: true };
+    }
+
+    // 2) 仅当 live 不可用且 HTML 里的 ID 匹配时才用 HTML 解析
+    let player = live.player;
+    let data = parseJsonFromPage("ytInitialData");
+    if (!player) {
+      const htmlPlayer = parseJsonFromPage("ytInitialPlayerResponse");
+      const htmlId = htmlPlayer?.videoDetails?.videoId;
+      if (!videoId || !htmlId || htmlId === videoId) {
+        player = htmlPlayer;
+      }
+    }
+
+    const details = player?.videoDetails || {};
+    const micro = live.micro || player?.microformat?.playerMicroformatRenderer || {};
+
+    // DOM 兜底（SPA 切页后 DOM 是当前视频）
     const domTitle =
-      document.querySelector("h1.ytd-watch-metadata yt-formatted-string, h1 yt-formatted-string, #title h1")
-        ?.textContent?.trim() || document.title.replace(/ - YouTube$/, "");
+      document.querySelector(
+        "h1.ytd-watch-metadata yt-formatted-string, h1 yt-formatted-string, #title h1, ytd-watch-metadata h1"
+      )?.textContent?.trim() || document.title.replace(/ - YouTube$/, "");
     const domChannel =
       document.querySelector(
         "ytd-channel-name #text a, #channel-name #text a, ytd-watch-metadata #channel-name a, #owner #channel-name a"
       )?.textContent?.trim() || "";
-    const domViews =
-      document.querySelector(
-        "ytd-watch-info-text #info span, #info #view-count #count, ytd-watch-metadata #info span"
-      )?.textContent?.trim() || "";
+    const domInfo = parseViewsAndDateFromDom();
+    const domDuration = parseDurationFromDom();
+    const domChannelId = parseChannelIdFromDom();
 
+    // 封面：优先按「当前 URL 的 videoId」拼官方图
+    let bestThumb = null;
+    if (videoId) {
+      bestThumb = {
+        url: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+        width: 1280,
+        height: 720,
+      };
+    }
     const thumbs = details.thumbnail?.thumbnails || micro.thumbnail?.thumbnails || [];
-    const bestThumb = pickBestThumb(thumbs);
-
-    // 描述：优先 shortDescription，再从 DOM / ytInitialData 展开后的 description
-    let description = details.shortDescription || "";
-    if (!description) {
-      const descEl = document.querySelector(
-        "ytd-text-inline-expander#description-inline-expander, #description-inline-expander, ytd-watch-metadata #description"
-      );
-      // 尝试点开“显示更多”
-      const moreBtn = document.querySelector(
-        "#description-inline-expander tp-yt-paper-button#expand, #expand"
-      );
-      if (moreBtn) {
-        try {
-          moreBtn.click();
-        } catch (_) {
-          /* ignore */
-        }
-      }
-      description = (descEl?.innerText || descEl?.textContent || "").trim();
+    const fromJson = pickBestThumb(thumbs);
+    if (fromJson && videoId && fromJson.url.includes(videoId)) {
+      bestThumb = fromJson;
     }
 
-    // 标签
+    // 描述：当前页 DOM 优先
+    let description = "";
+    const descEl = document.querySelector(
+      "ytd-text-inline-expander#description-inline-expander, #description-inline-expander, ytd-watch-metadata #description"
+    );
+    const moreBtn = document.querySelector(
+      "#description-inline-expander tp-yt-paper-button#expand, #expand"
+    );
+    if (moreBtn) {
+      try {
+        moreBtn.click();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    description = (descEl?.innerText || descEl?.textContent || "").trim();
+    if (!description) description = details.shortDescription || "";
+
     let keywords = details.keywords || micro.keywords || [];
     if (!Array.isArray(keywords)) keywords = [];
+    if (live.stale && !details.keywords) keywords = [];
 
-    // 时长
+    // 时长 / 播放量 / 发布日期：JSON 缺失时用 DOM
     const lengthSeconds = Number(details.lengthSeconds || micro.lengthSeconds || 0);
+    const durationText =
+      lengthSeconds > 0 ? formatSeconds(lengthSeconds) : domDuration || "";
 
-    // 发布日期
-    const publishDate = micro.publishDate || micro.uploadDate || "";
-    const uploadDate = micro.uploadDate || micro.publishDate || "";
+    const viewCount =
+      details.viewCount != null && Number(details.viewCount) > 0
+        ? Number(details.viewCount)
+        : domInfo.views;
 
-    // 播放量
-    const viewCount = details.viewCount != null ? Number(details.viewCount) : null;
+    const publishDate = micro.publishDate || micro.uploadDate || domInfo.published || "";
+    const uploadDate = micro.uploadDate || micro.publishDate || domInfo.published || "";
 
-    // 章节
+    // 简介正文里也有日期/观看数，再兜一层
+    let pubFinal = publishDate;
+    if (!pubFinal && description) {
+      const cn = description.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+      if (cn) {
+        pubFinal = `${cn[1]}-${String(cn[2]).padStart(2, "0")}-${String(cn[3]).padStart(2, "0")}`;
+      }
+    }
+    let viewFinal = viewCount;
+    if ((viewFinal == null || viewFinal === 0) && description) {
+      const m = description.match(/([\d][\d,.]*)\s*(万|亿)?\s*(次观看|views?)/i);
+      if (m) {
+        let n = Number(String(m[1]).replace(/,/g, ""));
+        if (m[2] === "万") n = Math.round(n * 10000);
+        if (m[2] === "亿") n = Math.round(n * 100000000);
+        if (Number.isFinite(n) && n > 0) viewFinal = n;
+      }
+    }
+
     let chapters = parseChaptersFromPlayer(player) || [];
     if (!chapters.length) chapters = parseChaptersFromDescription(description);
     if (!chapters.length) chapters = parseChaptersFromDom();
-    // 补章节缩略图：没有则用视频封面/时间戳链接
     chapters = chapters.map((c, idx) => {
       let thumb = c.thumbnailUrl;
-      if (!thumb && videoId) {
-        // YouTube 官方封面，不保证章节时间点
+      if (!thumb && videoId) thumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+      if (thumb && videoId && thumb.includes("i.ytimg.com") && !thumb.includes(videoId)) {
         thumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
       }
       return {
@@ -1353,34 +1574,28 @@
       };
     });
 
-    // 简介中的标签
     const hashtags = extractHashtags(description);
 
     return {
       videoId,
       url: normalizeUrl(videoId),
-      title: details.title || domTitle || "",
-      channel: details.author || micro.ownerChannelName || domChannel || "",
+      title: domTitle || details.title || "",
+      channel: domChannel || details.author || micro.ownerChannelName || "",
       channelId:
-        details.channelId ||
-        micro.externalChannelId ||
-        micro.ownerProfileId ||
-        "",
-      views: viewCount,
-      viewsText: viewCount != null ? formatViews(viewCount) : (domViews || ""),
-      published: publishDate,
-      uploadDate,
+        details.channelId || micro.externalChannelId || domChannelId || "",
+      views: viewFinal,
+      viewsText: viewFinal != null ? formatViews(viewFinal) : "",
+      published: pubFinal,
+      uploadDate: uploadDate || pubFinal,
       durationSeconds: lengthSeconds,
-      durationText: formatSeconds(lengthSeconds),
+      durationText,
       category: micro.category || "",
       isLive: !!(details.isLiveContent || details.isLive),
-      isFamilySafe: micro.isFamilySafe,
       description,
       keywords,
       hashtags,
       thumbnail: bestThumb,
       chapters,
-      // 供后续抓取使用
       _player: player,
       _data: data,
     };
