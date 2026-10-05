@@ -93,15 +93,17 @@
     return null;
   }
 
-  function deepFindAll(obj, key, maxDepth = 14) {
+  function deepFindAll(obj, key, maxDepth = 14, maxVisit = 4000) {
     const out = [];
     const seen = new Set();
     const stack = [{ o: obj, d: 0 }];
-    while (stack.length) {
+    let visits = 0;
+    while (stack.length && visits < maxVisit) {
       const { o, d } = stack.pop();
       if (!o || typeof o !== "object" || d > maxDepth) continue;
       if (seen.has(o)) continue;
       seen.add(o);
+      visits++;
       if (Object.prototype.hasOwnProperty.call(o, key) && o[key] != null) {
         out.push(o[key]);
       }
@@ -780,7 +782,7 @@
     return "";
   }
 
-  /** 主世界桥：content script 读不到 window.ytInitialData，用临时 script + DOM 传出来 */
+  /** 主世界桥：只走已知评论路径 + 限量搜索，禁止全量深挖（会卡死页面） */
   function extractCommentsViaPageBridge() {
     const bridgeId = "__ytObsidianCommentBridge";
     document.getElementById(bridgeId)?.remove();
@@ -811,50 +813,80 @@
             (o.content && (o.content.content || o.content.text)) || "";
         }
         var acc = [];
-        function walk(o, depth) {
-          if (!o || typeof o !== "object" || depth > 16) return;
-          if (Array.isArray(o)) {
-            for (var i = 0; i < o.length; i++) walk(o[i], depth + 1);
-            return;
-          }
-          try {
-            if (o.commentThreadRenderer) {
-              var th = o.commentThreadRenderer;
-              var cr = (th.comment && (th.comment.commentRenderer || th.comment.commentViewModel)) || null;
-              if (cr) {
-                acc.push({
-                  author: pickAuthor(cr),
-                  content: pickContent(cr),
-                  published: text(cr.publishedTimeText) || text(cr.publishedTime),
-                  likes: text(cr.voteCount) || text(cr.voteCountIfNotZero) || "",
-                  replyCount: 0
-                });
-              }
-            } else if (o.commentRenderer) {
-              acc.push({
-                author: pickAuthor(o.commentRenderer),
-                content: pickContent(o.commentRenderer),
-                published: text(o.commentRenderer.publishedTimeText) || "",
-                likes: text(o.commentRenderer.voteCount) || "",
-                replyCount: 0
-              });
-            } else if (o.commentViewModel || o.commentEntityPayload) {
-              var vm = o.commentViewModel || o.commentEntityPayload;
-              acc.push({
-                author: pickAuthor(vm),
-                content: pickContent(vm),
-                published: text(vm.publishedTimeText) || text(vm.publishedTime) || "",
-                likes: text(vm.voteCount) || "",
+        var seen = {};
+        function push(c) {
+          if (!c || (!c.content && !c.author)) return;
+          var k = (c.author || "") + "|" + String(c.content || "").slice(0, 80);
+          if (seen[k]) return;
+          seen[k] = 1;
+          acc.push(c);
+        }
+        function fromThread(th) {
+          var cr = (th.comment && (th.comment.commentRenderer || th.comment.commentViewModel)) || th.commentRenderer;
+          if (!cr) return;
+          push({
+            author: pickAuthor(cr),
+            content: pickContent(cr),
+            published: text(cr.publishedTimeText) || "",
+            likes: text(cr.voteCount) || text(cr.voteCountIfNotZero) || "",
+            replyCount: 0
+          });
+        }
+        function walkList(arr, depth) {
+          if (!Array.isArray(arr) || depth > 8) return;
+          for (var i = 0; i < arr.length; i++) {
+            var item = arr[i];
+            if (!item || typeof item !== "object") continue;
+            if (item.commentThreadRenderer) fromThread(item.commentThreadRenderer);
+            if (item.commentRenderer) {
+              push({
+                author: pickAuthor(item.commentRenderer),
+                content: pickContent(item.commentRenderer),
+                published: text(item.commentRenderer.publishedTimeText) || "",
+                likes: "",
                 replyCount: 0
               });
             }
-          } catch (e) {}
-          for (var k in o) {
-            if (Object.prototype.hasOwnProperty.call(o, k)) walk(o[k], depth + 1);
+            if (item.itemSectionRenderer && item.itemSectionRenderer.contents) {
+              walkList(item.itemSectionRenderer.contents, depth + 1);
+            }
+            if (item.sectionListRenderer && item.sectionListRenderer.contents) {
+              walkList(item.sectionListRenderer.contents, depth + 1);
+            }
           }
         }
-        walk(window.ytInitialData, 0);
-        walk(window.ytInitialPlayerResponse, 0);
+        var d = window.ytInitialData;
+        if (d) {
+          try {
+            var contents =
+              (d.contents && d.contents.twoColumnWatchNextResults && d.contents.twoColumnWatchNextResults.results &&
+                d.contents.twoColumnWatchNextResults.results.results && d.contents.twoColumnWatchNextResults.results.results.contents) || [];
+            walkList(contents, 0);
+          } catch (e) {}
+          try {
+            var panels = d.engagementPanels || [];
+            walkList(panels, 0);
+          } catch (e) {}
+        }
+        // 兜底：限量 BFS，只找评论节点，最多 3000 个对象
+        if (!acc.length && d) {
+          var q = [d], n = 0, seenObj = [];
+          while (q.length && n < 3000) {
+            var o = q.shift();
+            if (!o || typeof o !== "object") continue;
+            if (seenObj.indexOf(o) !== -1) continue;
+            seenObj.push(o);
+            n++;
+            if (o.commentThreadRenderer) fromThread(o.commentThreadRenderer);
+            if (Array.isArray(o)) {
+              for (var i = 0; i < o.length; i++) q.push(o[i]);
+            } else {
+              for (var k in o) {
+                if (Object.prototype.hasOwnProperty.call(o, k)) q.push(o[k]);
+              }
+            }
+          }
+        }
         var el = document.getElementById("__ytObsidianCommentBridge");
         if (el) el.textContent = JSON.stringify(acc);
       })();
@@ -931,7 +963,6 @@
   function seedCommentsFromInitialData(map) {
     let count = 0;
     try {
-      // 1) 主世界桥（最可靠）
       const bridged = extractCommentsViaPageBridge();
       for (const c of bridged) {
         const content = cleanCommentText(c.content);
@@ -947,8 +978,10 @@
       /* ignore */
     }
 
+    // 桥已有数据就不再解析整页 JSON（避免卡顿）
+    if (count > 0) return count;
+
     try {
-      // 2) 解析 HTML 内嵌 JSON
       const data = parseJsonFromPage("ytInitialData");
       for (const c of extractCommentsFromInitialData(data)) {
         const content = cleanCommentText(c.content);
@@ -1158,145 +1191,85 @@
     let seeded = 0;
     let domBefore = 0;
     let err = null;
+    // 硬截止 28s，保证一定能返回，避免外层 timeout 变成 0 条
+    const hardDeadline = Date.now() + 28000;
 
     try {
-      // 无论评论区 DOM 是否就绪，都先从页内数据取一批
       seeded = seedCommentsFromInitialData(collected);
 
       const commentsHeader = document.querySelector(
-        "#comments, ytd-comments#comments, ytd-comments, ytd-item-section-renderer #contents"
+        "#comments, ytd-comments#comments, ytd-comments"
       );
 
-      // 阶段1：向下滚加载完所有一级评论（先不展开回复）
-      // 阶段2：回到第一条评论
-      // 阶段3：再展开折叠的楼中楼并采集
-      const phase1Deadline = Date.now() + 18000;
-
-      if (commentsHeader) {
-        commentsHeader.scrollIntoView({ block: "start" });
-        await sleep(500);
-      } else {
-        // 评论区节点可能在简介下方，往下滚找一找
-        window.scrollBy(0, 900);
-        await sleep(400);
-      }
-
-      for (let i = 0; i < 25 && Date.now() < phase1Deadline; i++) {
-        if (findCommentThreads().length > 0) break;
-        (commentsHeader || document.body).scrollIntoView?.({ block: "start" });
-        window.scrollBy(0, 400);
-        await sleep(300);
-      }
-
-      domBefore = findCommentThreads().length;
-
-      // 确保按热度排序（Top）
-      try {
-        const sortMenu = document.querySelector(
-          "ytd-comments-header-renderer #sort-menu, ytd-comments-header-renderer ytd-sort-filter-submenu-renderer"
-        );
-        const menuText = (sortMenu?.textContent || "").toLowerCase();
-        if (sortMenu && /(newest|最新)/i.test(menuText) && !/热门|top/i.test(menuText)) {
-          sortMenu.click();
-          await sleep(250);
-          const topOption = [
-            ...document.querySelectorAll(
-              "ytd-comments-header-renderer tp-yt-paper-item, ytd-menu-service-item-renderer, tp-yt-paper-listbox tp-yt-paper-item"
-            ),
-          ].find((el) => /热门|top |热度|top comments/i.test(el.textContent || ""));
-          if (topOption) {
-            topOption.click();
-            await sleep(500);
-          }
+      const phase1Deadline = Date.now() + 14000;
+      if (Date.now() < hardDeadline) {
+        if (commentsHeader) {
+          commentsHeader.scrollIntoView({ block: "start" });
+          await sleep(400);
+        } else {
+          window.scrollBy(0, 800);
+          await sleep(300);
         }
-      } catch (_) {
-        /* ignore */
+
+        for (let i = 0; i < 15 && Date.now() < phase1Deadline && Date.now() < hardDeadline; i++) {
+          if (findCommentThreads().length > 0) break;
+          window.scrollBy(0, 400);
+          await sleep(250);
+        }
+
+        domBefore = findCommentThreads().length;
+        collectInto(collected);
       }
 
+      // 下滑加载一级评论
       let stagnant = 0;
-
-      while (Date.now() < phase1Deadline) {
+      while (Date.now() < phase1Deadline && Date.now() < hardDeadline && collected.size < limit) {
         collectInto(collected);
-
         const threads = findCommentThreads();
         const lastThread = threads[threads.length - 1];
         if (lastThread) {
           try {
-            lastThread.scrollIntoView({ block: "end", behavior: "instant" });
-          } catch (_) {
             lastThread.scrollIntoView({ block: "end" });
-          }
-        }
-        window.scrollBy(0, 480);
-
-        const pending = hasPendingContinuation();
-        await sleep(pending ? 550 : 320);
-
-        const before = collected.size;
-        collectInto(collected);
-
-        if (collected.size > before) {
-          stagnant = 0;
-          continue;
-        }
-
-        stagnant++;
-        if (isLoadingComments() && stagnant < 6) {
-          await sleep(450);
-          collectInto(collected);
-          if (collected.size > before) {
-            stagnant = 0;
-            continue;
-          }
-        }
-
-        if (pending && stagnant === 2) {
-          try {
-            const btn = (document.querySelector("#comments") || document).querySelector(
-              "ytd-continuation-item-renderer button, ytd-continuation-item-renderer #button"
-            );
-            if (btn && isVisible(btn)) {
-              btn.click();
-              await sleep(650);
-              collectInto(collected);
-              if (collected.size > before) {
-                stagnant = 0;
-                continue;
-              }
-            }
           } catch (_) {
             /* ignore */
           }
         }
+        window.scrollBy(0, 420);
+        await sleep(320);
 
-        if (stagnant >= 4) break;
+        const before = collected.size;
+        collectInto(collected);
+        if (collected.size > before) {
+          stagnant = 0;
+          continue;
+        }
+        stagnant++;
+        if (stagnant >= 3) break;
       }
 
-      // 阶段2/3：回到顶部并展开楼中楼
-      await scrollToFirstComment();
-      try {
-        await expandCollapsedReplies(60);
-        collectInto(collected);
-      } catch (_) {
-        /* ignore */
+      if (Date.now() < hardDeadline) {
+        await scrollToFirstComment();
+        try {
+          await expandCollapsedReplies(40);
+          collectInto(collected);
+        } catch (_) {
+          /* ignore */
+        }
       }
     } catch (e) {
       err = String(e && e.message ? e.message : e);
     }
 
-    // 最后再垫一次，保证不是 0
     if (collected.size === 0) {
       seedCommentsFromInitialData(collected);
     }
-
-    const withReplies = [...collected.values()].filter((c) => c.replies?.length).length;
 
     return {
       comments: [...collected.values()].slice(0, limit),
       method: "bridge+dom-scroll",
       seeded,
       domBefore,
-      withReplies,
+      withReplies: [...collected.values()].filter((c) => c.replies?.length).length,
       error: err,
     };
   }
