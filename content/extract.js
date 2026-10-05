@@ -1235,6 +1235,132 @@
     };
   }
 
+  /**
+   * 解析播放器热度图 SVG。
+   * YouTube 会把进度条拆成多段 ytp-heat-map / ytp-heat-map-chapter，
+   * 每段 SVG 的 viewBox 都是 0..1000，必须按 left/width 映射回全局时间。
+   */
+  function parseHeatmapFromSvg(durationSeconds) {
+    try {
+      const container =
+        document.querySelector(".ytp-heat-map-container") || document.querySelector(".ytp-heat-map") || document;
+      const segments = [
+        ...container.querySelectorAll(".ytp-heat-map, .ytp-heat-map-chapter"),
+      ];
+      if (!segments.length) {
+        // 退回：单条 path
+        const d = document.querySelector("path.ytp-modern-heat-map")?.getAttribute("d");
+        return d ? pointsFromHeatPath(d, 0, 1, durationSeconds) : [];
+      }
+
+      // 计算整条进度条宽度（left+width 的最大值）
+      let total = 0;
+      const segMeta = segments.map((el) => {
+        const style = el.getAttribute("style") || "";
+        const left = Number((style.match(/left:\s*([\d.]+)px/) || [])[1] || 0);
+        const width = Number((style.match(/width:\s*([\d.]+)px/) || [])[1] || 0);
+        total = Math.max(total, left + width);
+        return { el, left, width };
+      });
+      if (!total) {
+        total = segments.length * 100;
+        segMeta.forEach((m, i) => {
+          if (!m.width) {
+            m.left = i * 100;
+            m.width = 100;
+          }
+        });
+      }
+
+      const all = [];
+      for (const { el, left, width } of segMeta) {
+        const path =
+          el.querySelector("path.ytp-modern-heat-map") ||
+          el.querySelector("path.ytp-heat-map-path");
+        const d = path?.getAttribute("d") || "";
+        if (!d || !/C\s/.test(d)) continue;
+        // 该段覆盖的全局时间比例
+        const gStart = left / total;
+        const gEnd = (left + width) / total;
+        all.push(...pointsFromHeatPath(d, gStart, gEnd, durationSeconds));
+      }
+
+      // 去重排序
+      const seen = new Set();
+      return all
+        .filter((p) => {
+          const k = `${p.startMs}|${Math.round(p.score * 1000)}`;
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        })
+        .sort((a, b) => a.startMs - b.startMs);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /** 从 path.d 提取点；localT 0-1 映射到 globalT0..globalT1 */
+  function pointsFromHeatPath(d, globalT0, globalT1, durationSeconds) {
+    // 解析绝对坐标的 M/C，沿三次贝塞尔插值，避免只取锚点导致折线生硬
+    const tokens = d.match(/[MCZ][^MCZ]*/gi) || [];
+    const out = [];
+    let curX = 0;
+    let curY = 100;
+
+    const pushPoint = (x, y) => {
+      // 丢掉路径首尾「落到基线」的闭合伪点
+      if (x <= 0.5 && y >= 95) return;
+      if (x >= 999.5 && y >= 95) return;
+      const localT = Math.max(0, Math.min(1, x / 1000));
+      const t = globalT0 + localT * (globalT1 - globalT0);
+      const heat = Math.max(0, Math.min(1, (100 - y) / 100));
+      const durSec = Number(durationSeconds) || 0;
+      out.push({
+        startMs: Math.round(t * durSec * 1000),
+        endMs: Math.round(t * durSec * 1000),
+        score: Math.round(heat * 1000) / 1000,
+      });
+    };
+
+    for (const tok of tokens) {
+      const nums = (tok.match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi) || []).map(Number);
+      const cmd = tok.trim()[0].toUpperCase();
+      if (cmd === "M" && nums.length >= 2) {
+        curX = nums[0];
+        curY = nums[1];
+        pushPoint(curX, curY);
+      } else if (cmd === "C" && nums.length >= 6) {
+        const x1 = nums[0];
+        const y1 = nums[1];
+        const x2 = nums[2];
+        const y2 = nums[3];
+        const x3 = nums[4];
+        const y3 = nums[5];
+        // 每段多取插值点，保证接近 1s 粒度
+        const samples = 12;
+        for (let i = 1; i <= samples; i++) {
+          const t = i / samples;
+          const mt = 1 - t;
+          const x =
+            mt * mt * mt * curX +
+            3 * mt * mt * t * x1 +
+            3 * mt * t * t * x2 +
+            t * t * t * x3;
+          const y =
+            mt * mt * mt * curY +
+            3 * mt * mt * t * y1 +
+            3 * mt * t * t * y2 +
+            t * t * t * y3;
+          pushPoint(x, y);
+        }
+        curX = x3;
+        curY = y3;
+      }
+    }
+    return out;
+  }
+
   /** 使用 background 注入 MAIN world 得到的精简数据（已过滤过期 videoId） */
   function selectLivePage(pageWorld, currentVideoId) {
     const pw = pageWorld || {};
@@ -1351,6 +1477,21 @@
     return m2 ? `@${m2[1]}` : "";
   }
 
+  /** 使用 background 注入 MAIN world 得到的精简数据（已过滤过期 videoId） */
+  function selectLivePage(pageWorld, currentVideoId) {
+    const pw = pageWorld || {};
+    const playerVideoId = pw.playerVideoId || pw.player?.videoDetails?.videoId || null;
+    if (currentVideoId && playerVideoId && playerVideoId !== currentVideoId) {
+      return { player: null, micro: null, stale: true, playerVideoId };
+    }
+    return {
+      player: pw.player || null,
+      micro: pw.micro || null,
+      stale: !pw.player,
+      playerVideoId,
+    };
+  }
+
   function extractBasicInfo(pageWorld) {
     const videoId = getVideoId();
     const live = selectLivePage(pageWorld, videoId);
@@ -1459,6 +1600,12 @@
 
     const hashtags = extractHashtags(description);
 
+    // 热度图：JSON 优先，SVG 兜底
+    let heatmap = Array.isArray(pageWorld?.heatmap) ? pageWorld.heatmap : [];
+    if (!heatmap.length) {
+      heatmap = parseHeatmapFromSvg(lengthSeconds || durationTextToSeconds(durationText));
+    }
+
     return {
       videoId,
       url: normalizeUrl(videoId),
@@ -1479,9 +1626,16 @@
       hashtags,
       thumbnail: bestThumb,
       chapters,
+      heatmap,
       _player: player,
       _data: data,
     };
+  }
+
+  function durationTextToSeconds(text) {
+    const parts = String(text || "").split(":").map(Number);
+    if (parts.some((n) => !Number.isFinite(n))) return 0;
+    return parts.reduce((acc, n) => acc * 60 + n, 0);
   }
 
   function withTimeout(promise, ms, fallback) {

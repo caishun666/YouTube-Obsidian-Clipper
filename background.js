@@ -89,6 +89,7 @@ async function readPageWorld(sender) {
         micro: null,
         playerVideoId: null,
         comments: [],
+        heatmap: [],
       };
 
       try {
@@ -211,6 +212,98 @@ async function readPageWorld(sender) {
           }
         }
         payload.comments = acc;
+      } catch (_) {
+        /* ignore */
+      }
+
+      // Heatmap / most replayed
+      try {
+        const markers = [];
+        const seen = new Set();
+        const pushMarker = (mr) => {
+          if (!mr || typeof mr !== "object") return;
+          const start = Number(
+            mr.timeRangeStartMillis ?? mr.startMs ?? mr.startMsMillis
+          );
+          const end = Number(mr.timeRangeEndMillis ?? mr.endMs ?? mr.endMsMillis);
+          const scoreRaw =
+            mr.heatMarkerIntensityScoreNormalized ??
+            mr.intensityScoreNormalized ??
+            mr.score ??
+            mr.normalizedScore;
+          const score = Number(scoreRaw);
+          if (!Number.isFinite(start)) return;
+          const item = {
+            startMs: start,
+            endMs: Number.isFinite(end) && end >= start ? end : start,
+            score: Number.isFinite(score) ? score : null,
+          };
+          const k = `${item.startMs}|${item.endMs}|${item.score}`;
+          if (seen.has(k)) return;
+          seen.add(k);
+          markers.push(item);
+        };
+
+        const walkHeat = (o, depth) => {
+          if (!o || typeof o !== "object" || depth > 18) return;
+          if (Array.isArray(o)) {
+            for (const x of o) walkHeat(x, depth + 1);
+            return;
+          }
+
+          // 单个 marker
+          if (o.heatMarkerRenderer) pushMarker(o.heatMarkerRenderer);
+          if (o.heatMarkerViewModel) pushMarker(o.heatMarkerViewModel);
+          // 自带字段的 marker
+          if (
+            o.timeRangeStartMillis != null &&
+            (o.heatMarkerIntensityScoreNormalized != null ||
+              o.intensityScoreNormalized != null ||
+              o.score != null)
+          ) {
+            pushMarker(o);
+          }
+
+          // 列表容器
+          for (const key of Object.keys(o)) {
+            const v = o[key];
+            if (
+              Array.isArray(v) &&
+              /heat|marker/i.test(key) &&
+              v.length &&
+              typeof v[0] === "object"
+            ) {
+              for (const m of v) {
+                if (!m || typeof m !== "object") continue;
+                pushMarker(m.heatMarkerRenderer || m.heatMarkerViewModel || m);
+              }
+            }
+          }
+
+          for (const k of Object.keys(o)) walkHeat(o[k], depth + 1);
+        };
+
+        walkHeat(window.ytInitialPlayerResponse, 0);
+        walkHeat(window.ytInitialData, 0);
+
+        // 定向再扫一遍常见路径
+        try {
+          const ov =
+            window.ytInitialPlayerResponse?.playerOverlays?.playerOverlayRenderer;
+          const multi =
+            ov?.decoratedPlayerBarRenderer?.decoratedPlayerBarViewModel
+              ?.multiMarkersPlayerBarViewModel || ov?.multiMarkersPlayerBarViewModel;
+          const hm = multi?.heatmapViewModel || multi?.heatmapRenderer;
+          const list = hm?.heatMarkers || hm?.markers || [];
+          for (const m of list) {
+            pushMarker(m?.heatMarkerRenderer || m?.heatMarkerViewModel || m);
+          }
+        } catch (_) {
+          /* ignore */
+        }
+
+        markers.sort((a, b) => a.startMs - b.startMs);
+        payload.heatmap = markers;
       } catch (_) {
         /* ignore */
       }
