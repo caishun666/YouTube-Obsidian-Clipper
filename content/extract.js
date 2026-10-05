@@ -194,12 +194,20 @@
         if (seconds == null && item.onTap?.watchEndpoint?.startTimeSeconds == null) continue;
         const sec = seconds ?? item.onTap.watchEndpoint.startTimeSeconds;
         let thumb = null;
-        const thumbs =
-          item.thumbnail?.thumbnails ||
-          item.thumbnails ||
-          deepFind(item, "thumbnails");
-        if (Array.isArray(thumbs) && thumbs.length) {
-          thumb = thumbs[thumbs.length - 1].url;
+        const candidates = [
+          item.thumbnail?.thumbnails,
+          item.thumbnails,
+          item.thumbnail?.playerThumbnail?.thumbnails,
+        ];
+        for (const arr of candidates) {
+          if (Array.isArray(arr) && arr.length) {
+            const u = arr[arr.length - 1]?.url || arr[0]?.url;
+            if (u && !thumb) thumb = u;
+          }
+        }
+        if (!thumb) {
+          const any = deepFind(item, "thumbnails", 6);
+          if (Array.isArray(any) && any.length) thumb = any[any.length - 1]?.url || null;
         }
         chapters.push({
           seconds: Number(sec),
@@ -215,6 +223,42 @@
     }
   }
 
+  function thumbFromNode(node) {
+    // 1) img src / srcset / data-src
+    const imgs = [...node.querySelectorAll("img")];
+    for (const img of imgs) {
+      const src =
+        img.currentSrc ||
+        img.src ||
+        img.getAttribute("src") ||
+        img.getAttribute("data-src") ||
+        "";
+      if (src && /ytimg|ggpht|googleusercontent|yt3\./i.test(src) && !/avatar|channel/i.test(src)) {
+        return src.split("?")[0];
+      }
+      const srcset = img.getAttribute("srcset") || "";
+      if (srcset) {
+        const last = srcset.split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean).pop();
+        if (last) return last.split("?")[0];
+      }
+    }
+    // 2) background-image
+    const bgEls = [
+      node.querySelector("#thumbnail, .ytd-macro-markers-list-item-renderer #thumbnail"),
+      node.querySelector("yt-image, yt-img-shadow, .yt-core-image"),
+      node,
+    ];
+    for (const el of bgEls) {
+      const bg =
+        (el?.style?.backgroundImage || getComputedStyle?.(el)?.backgroundImage || "") + "";
+      const m = bg.match(/url\((['"]?)(.*?)\1\)/);
+      if (m && m[2] && /ytimg|ggpht/i.test(m[2])) {
+        return m[2].split("?")[0];
+      }
+    }
+    return null;
+  }
+
   function parseChaptersFromDom() {
     const nodes = document.querySelectorAll(
       "ytd-macro-markers-list-item-renderer, ytd-chapter-renderer"
@@ -222,18 +266,14 @@
     const chapters = [];
     nodes.forEach((node) => {
       const titleEl =
-        node.querySelector("#details h4, #details #video-title, h4, [title]") ||
-        node;
-      const timeEl = node.querySelector("#time, .ytd-macro-markers-list-item-renderer #time");
-      const title = (titleEl.getAttribute("title") || titleEl.textContent || "").trim();
+        node.querySelector("#details h4, #details #video-title, h4, [title]") || node;
+      const timeEl = node.querySelector(
+        "#time, .ytd-macro-markers-list-item-renderer #time, ytd-macro-markers-list-item-renderer #time"
+      );
+      const title = (titleEl.getAttribute("title") || titleEl.textContent || "").replace(/\s+/g, " ").trim();
       const timeText = (timeEl?.textContent || "").trim();
       const seconds = parseTimestampToSeconds(timeText);
-      const img = node.querySelector("img");
-      const thumb =
-        img?.src ||
-        img?.getAttribute("src") ||
-        (img?.style?.backgroundImage || "").replace(/^url\(["']?/, "").replace(/["']?\)$/, "") ||
-        null;
+      const thumb = thumbFromNode(node);
       if (seconds == null) return;
       chapters.push({
         seconds,
@@ -243,6 +283,58 @@
       });
     });
     return chapters;
+  }
+
+  /** YouTube 官方「不同帧」缩略图：hq1/hq2/hq3、maxres1-3 等 */
+  function chapterFrameThumb(videoId, index) {
+    if (!videoId) return null;
+    const variants = [
+      `https://i.ytimg.com/vi/${videoId}/hq1.jpg`,
+      `https://i.ytimg.com/vi/${videoId}/hq2.jpg`,
+      `https://i.ytimg.com/vi/${videoId}/hq3.jpg`,
+      `https://i.ytimg.com/vi/${videoId}/maxres1.jpg`,
+      `https://i.ytimg.com/vi/${videoId}/maxres2.jpg`,
+      `https://i.ytimg.com/vi/${videoId}/maxres3.jpg`,
+    ];
+    return variants[index % variants.length];
+  }
+
+  /** 合并多来源章节：结构 + 缩略图 */
+  function mergeChapters(primary, fromDom, videoId) {
+    const bySec = new Map();
+    const put = (c) => {
+      if (!c || c.seconds == null) return;
+      const key = Number(c.seconds);
+      const prev = bySec.get(key);
+      if (!prev) {
+        bySec.set(key, { ...c, seconds: key });
+        return;
+      }
+      if (!prev.thumbnailUrl && c.thumbnailUrl) prev.thumbnailUrl = c.thumbnailUrl;
+      if ((!prev.title || prev.title.startsWith("章节 ")) && c.title) prev.title = c.title;
+    };
+    (primary || []).forEach(put);
+    (fromDom || []).forEach(put);
+
+    const list = [...bySec.values()].sort((a, b) => a.seconds - b.seconds);
+    return list.map((c, idx) => {
+      let thumb = c.thumbnailUrl;
+      // 禁止所有章节都用同一张封面图
+      const coverLike =
+        !thumb ||
+        /\/(default|mqdefault|sddefault|hqdefault|maxresdefault)\.jpg$/i.test(thumb) ||
+        thumb.includes(`i.ytimg.com/vi/${videoId}/hqdefault`) ||
+        thumb.includes(`i.ytimg.com/vi/${videoId}/maxresdefault`);
+      if (coverLike) {
+        thumb = chapterFrameThumb(videoId, idx) || thumb;
+      }
+      return {
+        ...c,
+        thumbnailUrl: thumb,
+        url: normalizeUrl(videoId) + `&t=${c.seconds}s`,
+        index: idx + 1,
+      };
+    });
   }
 
   function extractHashtags(description) {
@@ -782,126 +874,15 @@
     return "";
   }
 
-  /** 主世界桥：只走已知评论路径 + 限量搜索，禁止全量深挖（会卡死页面） */
-  function extractCommentsViaPageBridge() {
-    const bridgeId = "__ytObsidianCommentBridge";
-    document.getElementById(bridgeId)?.remove();
-
-    const el = document.createElement("pre");
-    el.id = bridgeId;
-    el.hidden = true;
-    el.style.display = "none";
-    document.documentElement.appendChild(el);
-
-    const s = document.createElement("script");
-    s.textContent = `
-      (function () {
-        function text(v) {
-          if (v == null) return "";
-          if (typeof v === "string") return v;
-          if (v.simpleText) return String(v.simpleText);
-          if (v.content) return String(v.content);
-          if (Array.isArray(v.runs)) return v.runs.map(function (x) { return x.text || ""; }).join("");
-          return "";
-        }
-        function pickAuthor(o) {
-          return text(o.authorText) || text(o.author) ||
-            (o.author && (o.author.displayName || o.author.name || o.author.text)) || "";
-        }
-        function pickContent(o) {
-          return text(o.contentText) || text(o.content) ||
-            (o.content && (o.content.content || o.content.text)) || "";
-        }
-        var acc = [];
-        var seen = {};
-        function push(c) {
-          if (!c || (!c.content && !c.author)) return;
-          var k = (c.author || "") + "|" + String(c.content || "").slice(0, 80);
-          if (seen[k]) return;
-          seen[k] = 1;
-          acc.push(c);
-        }
-        function fromThread(th) {
-          var cr = (th.comment && (th.comment.commentRenderer || th.comment.commentViewModel)) || th.commentRenderer;
-          if (!cr) return;
-          push({
-            author: pickAuthor(cr),
-            content: pickContent(cr),
-            published: text(cr.publishedTimeText) || "",
-            likes: text(cr.voteCount) || text(cr.voteCountIfNotZero) || "",
-            replyCount: 0
-          });
-        }
-        function walkList(arr, depth) {
-          if (!Array.isArray(arr) || depth > 8) return;
-          for (var i = 0; i < arr.length; i++) {
-            var item = arr[i];
-            if (!item || typeof item !== "object") continue;
-            if (item.commentThreadRenderer) fromThread(item.commentThreadRenderer);
-            if (item.commentRenderer) {
-              push({
-                author: pickAuthor(item.commentRenderer),
-                content: pickContent(item.commentRenderer),
-                published: text(item.commentRenderer.publishedTimeText) || "",
-                likes: "",
-                replyCount: 0
-              });
-            }
-            if (item.itemSectionRenderer && item.itemSectionRenderer.contents) {
-              walkList(item.itemSectionRenderer.contents, depth + 1);
-            }
-            if (item.sectionListRenderer && item.sectionListRenderer.contents) {
-              walkList(item.sectionListRenderer.contents, depth + 1);
-            }
-          }
-        }
-        var d = window.ytInitialData;
-        if (d) {
-          try {
-            var contents =
-              (d.contents && d.contents.twoColumnWatchNextResults && d.contents.twoColumnWatchNextResults.results &&
-                d.contents.twoColumnWatchNextResults.results.results && d.contents.twoColumnWatchNextResults.results.results.contents) || [];
-            walkList(contents, 0);
-          } catch (e) {}
-          try {
-            var panels = d.engagementPanels || [];
-            walkList(panels, 0);
-          } catch (e) {}
-        }
-        // 兜底：限量 BFS，只找评论节点，最多 3000 个对象
-        if (!acc.length && d) {
-          var q = [d], n = 0, seenObj = [];
-          while (q.length && n < 3000) {
-            var o = q.shift();
-            if (!o || typeof o !== "object") continue;
-            if (seenObj.indexOf(o) !== -1) continue;
-            seenObj.push(o);
-            n++;
-            if (o.commentThreadRenderer) fromThread(o.commentThreadRenderer);
-            if (Array.isArray(o)) {
-              for (var i = 0; i < o.length; i++) q.push(o[i]);
-            } else {
-              for (var k in o) {
-                if (Object.prototype.hasOwnProperty.call(o, k)) q.push(o[k]);
-              }
-            }
-          }
-        }
-        var el = document.getElementById("__ytObsidianCommentBridge");
-        if (el) el.textContent = JSON.stringify(acc);
-      })();
-    `;
-    document.documentElement.appendChild(s);
-    s.remove();
-
-    let out = [];
+  /** 通过扩展 background 在 MAIN world 读页面全局对象（避开 YouTube CSP） */
+  async function requestPageWorld() {
     try {
-      out = JSON.parse(el.textContent || "[]");
+      const res = await chrome.runtime.sendMessage({ type: "YT_PAGE_WORLD" });
+      if (res?.ok && res.data) return res.data;
+      return { player: null, micro: null, playerVideoId: null, comments: [] };
     } catch (_) {
-      out = [];
+      return { player: null, micro: null, playerVideoId: null, comments: [] };
     }
-    el.remove();
-    return Array.isArray(out) ? out : [];
   }
 
   function extractCommentsFromInitialData(data) {
@@ -960,43 +941,34 @@
     return out;
   }
 
-  function seedCommentsFromInitialData(map) {
+  function seedCommentsFromList(list, map) {
     let count = 0;
-    try {
-      const bridged = extractCommentsViaPageBridge();
-      for (const c of bridged) {
-        const content = cleanCommentText(c.content);
-        const author = c.author || "";
-        if (!content && !author) continue;
-        const key = `${author}|${content.slice(0, 100)}`;
-        if (!map.has(key)) {
-          map.set(key, { ...c, content, author, replies: [] });
-          count++;
-        }
+    for (const c of list || []) {
+      const content = cleanCommentText(c.content);
+      const author = c.author || "";
+      if (!content && !author) continue;
+      const key = `${author}|${content.slice(0, 100)}`;
+      if (!map.has(key)) {
+        map.set(key, { ...c, content, author, replies: c.replies || [] });
+        count++;
       }
-    } catch (_) {
-      /* ignore */
     }
+    return count;
+  }
 
-    // 桥已有数据就不再解析整页 JSON（避免卡顿）
+  function seedCommentsFromInitialData(map, pageWorld) {
+    let count = 0;
+    if (pageWorld?.comments?.length) {
+      count = seedCommentsFromList(pageWorld.comments, map);
+    }
     if (count > 0) return count;
 
     try {
       const data = parseJsonFromPage("ytInitialData");
-      for (const c of extractCommentsFromInitialData(data)) {
-        const content = cleanCommentText(c.content);
-        const author = c.author || "";
-        if (!content && !author) continue;
-        const key = `${author}|${content.slice(0, 100)}`;
-        if (!map.has(key)) {
-          map.set(key, { ...c, content, author, replies: c.replies || [] });
-          count++;
-        }
-      }
+      count = seedCommentsFromList(extractCommentsFromInitialData(data), map);
     } catch (_) {
       /* ignore */
     }
-
     return count;
   }
 
@@ -1060,21 +1032,10 @@
       "button, tp-yt-paper-button, yt-button-shape button, ytd-button-renderer button"
     );
     if (inner) return inner;
-    // ytd-continuation-item-renderer 本身可点
     if (el.tagName === "YTD-CONTINUATION-ITEM-RENDERER") {
       return el.querySelector("button, #button, yt-button-shape button") || el;
     }
     return null;
-  }
-
-  function clickTargetFrom(el) {
-    if (!el) return null;
-    if (el.tagName === "BUTTON" || el.tagName === "TP-YT-PAPER-BUTTON") return el;
-    return (
-      el.querySelector?.("button, tp-yt-paper-button, yt-button-shape button") ||
-      (el.closest?.("button, tp-yt-paper-button") ?? null) ||
-      el
-    );
   }
 
   /** 展开各主题下折叠的楼中楼（在一级评论加载完、回到顶部后调用） */
@@ -1186,7 +1147,7 @@
     );
   }
 
-  async function loadTopComments(limit = 100) {
+  async function loadTopComments(limit = 100, pageWorld) {
     const collected = new Map();
     let seeded = 0;
     let domBefore = 0;
@@ -1195,7 +1156,7 @@
     const hardDeadline = Date.now() + 28000;
 
     try {
-      seeded = seedCommentsFromInitialData(collected);
+      seeded = seedCommentsFromInitialData(collected, pageWorld);
 
       const commentsHeader = document.querySelector(
         "#comments, ytd-comments#comments, ytd-comments"
@@ -1261,7 +1222,7 @@
     }
 
     if (collected.size === 0) {
-      seedCommentsFromInitialData(collected);
+      seedCommentsFromInitialData(collected, pageWorld);
     }
 
     return {
@@ -1274,75 +1235,17 @@
     };
   }
 
-  /** 从主世界取「当前」player/data；SPA 切页后 HTML 内嵌 JSON 会是上一个视频 */
-  function loadPageJsonLive(currentVideoId) {
-    const bridgeId = "__ytObsidianPageJsonBridge";
-    document.getElementById(bridgeId)?.remove();
-    const el = document.createElement("pre");
-    el.id = bridgeId;
-    el.hidden = true;
-    el.style.display = "none";
-    document.documentElement.appendChild(el);
-
-    const s = document.createElement("script");
-    s.textContent = `
-      (function () {
-        var payload = { player: null, playerVideoId: null, micro: null };
-        try {
-          var p = window.ytInitialPlayerResponse;
-          if (p && p.videoDetails) {
-            payload.playerVideoId = p.videoDetails.videoId || null;
-            var d = p.videoDetails || {};
-            var mf = (p.microformat && p.microformat.playerMicroformatRenderer) || {};
-            payload.player = {
-              videoDetails: {
-                videoId: d.videoId,
-                title: d.title,
-                lengthSeconds: d.lengthSeconds,
-                keywords: d.keywords || [],
-                channelId: d.channelId,
-                shortDescription: d.shortDescription,
-                viewCount: d.viewCount,
-                author: d.author,
-                thumbnail: d.thumbnail,
-                isLiveContent: d.isLiveContent
-              }
-            };
-            payload.micro = {
-              publishDate: mf.publishDate || "",
-              uploadDate: mf.uploadDate || "",
-              category: mf.category || "",
-              ownerChannelName: mf.ownerChannelName || "",
-              externalChannelId: mf.externalChannelId || "",
-              lengthSeconds: mf.lengthSeconds
-            };
-          }
-        } catch (e) {}
-        var el = document.getElementById("__ytObsidianPageJsonBridge");
-        if (el) el.textContent = JSON.stringify(payload);
-      })();
-    `;
-    document.documentElement.appendChild(s);
-    s.remove();
-
-    let out = null;
-    try {
-      out = JSON.parse(el.textContent || "null");
-    } catch (_) {
-      out = null;
-    }
-    el.remove();
-
-    const player = out?.player || null;
-    const playerVideoId = out?.playerVideoId || player?.videoDetails?.videoId || null;
-
+  /** 使用 background 注入 MAIN world 得到的精简数据（已过滤过期 videoId） */
+  function selectLivePage(pageWorld, currentVideoId) {
+    const pw = pageWorld || {};
+    const playerVideoId = pw.playerVideoId || pw.player?.videoDetails?.videoId || null;
     if (currentVideoId && playerVideoId && playerVideoId !== currentVideoId) {
       return { player: null, micro: null, stale: true, playerVideoId };
     }
     return {
-      player,
-      micro: out?.micro || null,
-      stale: !player,
+      player: pw.player || null,
+      micro: pw.micro || null,
+      stale: !pw.player,
       playerVideoId,
     };
   }
@@ -1425,7 +1328,7 @@
     return "";
   }
 
-  function parseChannelIdFromDom() {
+  function parseChannelIdFromDom(pageWorld) {
     // 1) 经典 /channel/UC...
     const a1 = document.querySelector(
       '#channel-name a[href*="/channel/"], #owner a[href*="/channel/"], ytd-channel-name a[href*="/channel/"], #avatar-section a[href*="/channel/"]'
@@ -1434,32 +1337,23 @@
     const m1 = href1.match(/\/channel\/(UC[\w-]+)/);
     if (m1) return m1[1];
 
-    // 2) 只有 @handle 时，从页内 JSON 取 channelId；再不行存 handle 便于识别
+    // 2) 页内 JSON
+    const cid =
+      pageWorld?.player?.videoDetails?.channelId || pageWorld?.micro?.externalChannelId || "";
+    if (cid) return cid;
+
+    // 3) @handle
     const handleA = document.querySelector(
       '#channel-name a[href^="/@"], #owner a[href^="/@"], ytd-channel-name a[href^="/@"]'
     );
     const href2 = handleA?.getAttribute("href") || "";
     const m2 = href2.match(/\/@([\w.-]+)/);
-    try {
-      const live = loadPageJsonLive(getVideoId());
-      const cid = live?.player?.videoDetails?.channelId || live?.micro?.externalChannelId;
-      if (cid) return cid;
-    } catch (_) {
-      /* ignore */
-    }
     return m2 ? `@${m2[1]}` : "";
   }
 
-  function extractBasicInfo() {
+  function extractBasicInfo(pageWorld) {
     const videoId = getVideoId();
-
-    // 1) 主世界当前值（优先）
-    let live = { player: null, micro: null, stale: true };
-    try {
-      live = loadPageJsonLive(videoId);
-    } catch (_) {
-      live = { player: null, micro: null, stale: true };
-    }
+    const live = selectLivePage(pageWorld, videoId);
 
     // 2) 仅当 live 不可用且 HTML 里的 ID 匹配时才用 HTML 解析
     let player = live.player;
@@ -1486,7 +1380,7 @@
       )?.textContent?.trim() || "";
     const domInfo = parseViewsAndDateFromDom();
     const domDuration = parseDurationFromDom();
-    const domChannelId = parseChannelIdFromDom();
+    const domChannelId = parseChannelIdFromDom(pageWorld);
 
     // 封面：优先按「当前 URL 的 videoId」拼官方图
     let bestThumb = null;
@@ -1557,22 +1451,11 @@
       }
     }
 
-    let chapters = parseChaptersFromPlayer(player) || [];
-    if (!chapters.length) chapters = parseChaptersFromDescription(description);
-    if (!chapters.length) chapters = parseChaptersFromDom();
-    chapters = chapters.map((c, idx) => {
-      let thumb = c.thumbnailUrl;
-      if (!thumb && videoId) thumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-      if (thumb && videoId && thumb.includes("i.ytimg.com") && !thumb.includes(videoId)) {
-        thumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-      }
-      return {
-        ...c,
-        thumbnailUrl: thumb,
-        url: normalizeUrl(videoId) + `&t=${c.seconds}s`,
-        index: idx + 1,
-      };
-    });
+    const fromPlayer = parseChaptersFromPlayer(player) || [];
+    const fromDesc = parseChaptersFromDescription(description) || [];
+    const fromDom = parseChaptersFromDom() || [];
+    const primary = fromPlayer.length ? fromPlayer : fromDesc;
+    const chapters = mergeChapters(primary, fromDom, videoId);
 
     const hashtags = extractHashtags(description);
 
@@ -1616,7 +1499,9 @@
     const wantComments = options.comments !== false;
     const wantChapterThumbs = options.chapterThumbs !== false;
 
-    const basic = extractBasicInfo();
+    // 先取主世界数据（CSP 安全通道）
+    const pageWorld = await requestPageWorld();
+    const basic = extractBasicInfo(pageWorld);
 
     // 转文字（最多 12s）
     let transcript = { text: "", segments: [], method: "none" };
@@ -1637,7 +1522,7 @@
     if (wantComments) {
       try {
         commentResult = await withTimeout(
-          loadTopComments(commentLimit),
+          loadTopComments(commentLimit, pageWorld),
           35000,
           { comments: [], method: "timeout" }
         );

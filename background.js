@@ -12,6 +12,19 @@ import { buildNote, assetFileName, guessImageExt } from "./lib/markdown.js";
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
 
+  // 主世界读取页面全局对象（绕过 YouTube CSP，禁止在页面里塞 inline script）
+  if (msg.type === "YT_PAGE_WORLD") {
+    readPageWorld(sender)
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: String(err && err.message ? err.message : err),
+        })
+      );
+    return true;
+  }
+
   if (msg.type === "YT_CLIP_SAVE") {
     handleSave(msg.payload || {})
       .then((result) => sendResponse({ ok: true, ...result }))
@@ -36,6 +49,178 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+/** 在 MAIN world 序列化当前页 ytInitialPlayerResponse / 评论（精简，避免卡顿） */
+async function readPageWorld(sender) {
+  const tabId = sender?.tab?.id;
+  if (tabId == null) throw new Error("no-tab");
+
+  const [{ result } = {}] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: () => {
+      function text(v) {
+        if (v == null) return "";
+        if (typeof v === "string") return v;
+        if (v.simpleText) return String(v.simpleText);
+        if (v.content && typeof v.content === "string") return v.content;
+        if (Array.isArray(v.runs)) return v.runs.map((x) => x.text || "").join("");
+        return "";
+      }
+      function pickAuthor(o) {
+        return (
+          text(o && o.authorText) ||
+          text(o && o.author) ||
+          (o && o.author && (o.author.displayName || o.author.name || o.author.text)) ||
+          ""
+        );
+      }
+      function pickContent(o) {
+        return (
+          text(o && o.contentText) ||
+          text(o && o.content) ||
+          (o && o.content && (o.content.content || o.content.text)) ||
+          ""
+        );
+      }
+
+      const payload = {
+        player: null,
+        micro: null,
+        playerVideoId: null,
+        comments: [],
+      };
+
+      try {
+        const p = window.ytInitialPlayerResponse;
+        if (p && p.videoDetails) {
+          const d = p.videoDetails;
+          const mf = (p.microformat && p.microformat.playerMicroformatRenderer) || {};
+          payload.playerVideoId = d.videoId || null;
+          payload.player = {
+            videoDetails: {
+              videoId: d.videoId,
+              title: d.title,
+              lengthSeconds: d.lengthSeconds,
+              keywords: d.keywords || [],
+              channelId: d.channelId,
+              shortDescription: d.shortDescription,
+              viewCount: d.viewCount,
+              author: d.author,
+              thumbnail: d.thumbnail,
+              isLiveContent: d.isLiveContent,
+            },
+          };
+          payload.micro = {
+            publishDate: mf.publishDate || "",
+            uploadDate: mf.uploadDate || "",
+            category: mf.category || "",
+            ownerChannelName: mf.ownerChannelName || "",
+            externalChannelId: mf.externalChannelId || "",
+            lengthSeconds: mf.lengthSeconds,
+          };
+        }
+      } catch (_) {
+        /* ignore */
+      }
+
+      // 评论：只走已知路径 + 限量 BFS
+      try {
+        const acc = [];
+        const seen = {};
+        function push(c) {
+          if (!c || (!c.content && !c.author)) return;
+          const k = `${c.author || ""}|${String(c.content || "").slice(0, 80)}`;
+          if (seen[k]) return;
+          seen[k] = 1;
+          acc.push(c);
+        }
+        function fromThread(th) {
+          const cr =
+            (th.comment && (th.comment.commentRenderer || th.comment.commentViewModel)) ||
+            th.commentRenderer;
+          if (!cr) return;
+          push({
+            author: pickAuthor(cr),
+            content: pickContent(cr),
+            published: text(cr.publishedTimeText) || "",
+            likes: text(cr.voteCount) || text(cr.voteCountIfNotZero) || "",
+            replyCount: 0,
+          });
+        }
+        function walkList(arr, depth) {
+          if (!Array.isArray(arr) || depth > 8) return;
+          for (let i = 0; i < arr.length; i++) {
+            const item = arr[i];
+            if (!item || typeof item !== "object") continue;
+            if (item.commentThreadRenderer) fromThread(item.commentThreadRenderer);
+            if (item.commentRenderer) {
+              push({
+                author: pickAuthor(item.commentRenderer),
+                content: pickContent(item.commentRenderer),
+                published: text(item.commentRenderer.publishedTimeText) || "",
+                likes: "",
+                replyCount: 0,
+              });
+            }
+            if (item.itemSectionRenderer && item.itemSectionRenderer.contents) {
+              walkList(item.itemSectionRenderer.contents, depth + 1);
+            }
+            if (item.sectionListRenderer && item.sectionListRenderer.contents) {
+              walkList(item.sectionListRenderer.contents, depth + 1);
+            }
+          }
+        }
+
+        const d = window.ytInitialData;
+        if (d) {
+          try {
+            const contents =
+              (d.contents &&
+                d.contents.twoColumnWatchNextResults &&
+                d.contents.twoColumnWatchNextResults.results &&
+                d.contents.twoColumnWatchNextResults.results.results &&
+                d.contents.twoColumnWatchNextResults.results.results.contents) ||
+              [];
+            walkList(contents, 0);
+          } catch (_) {
+            /* ignore */
+          }
+          try {
+            walkList(d.engagementPanels || [], 0);
+          } catch (_) {
+            /* ignore */
+          }
+
+          if (!acc.length) {
+            const q = [d];
+            let n = 0;
+            const seenObj = new Set();
+            while (q.length && n < 2500) {
+              const o = q.shift();
+              if (!o || typeof o !== "object" || seenObj.has(o)) continue;
+              seenObj.add(o);
+              n++;
+              if (o.commentThreadRenderer) fromThread(o.commentThreadRenderer);
+              if (Array.isArray(o)) {
+                for (let i = 0; i < o.length; i++) q.push(o[i]);
+              } else {
+                for (const k of Object.keys(o)) q.push(o[k]);
+              }
+            }
+          }
+        }
+        payload.comments = acc;
+      } catch (_) {
+        /* ignore */
+      }
+
+      return payload;
+    },
+  });
+
+  return result || { player: null, micro: null, playerVideoId: null, comments: [] };
+}
 
 async function testObsidian({ baseUrl, apiKey }) {
   const client = createObsidianClient({
@@ -234,13 +419,14 @@ async function handleSave(payload) {
         continue;
       }
       try {
-        // 与封面相同 / 同源视频图时复用封面，避免重复上传
+        // 仅当就是封面同一 URL 时复用，章节独立帧不复用封面
+        const coverUrl = data.thumbnail?.url || "";
         const sameAsCover =
           thumbnailVaultPath &&
-          (c.thumbnailUrl === data.thumbnail?.url ||
-            (data.videoId &&
-              c.thumbnailUrl.includes(`i.ytimg.com/vi/${data.videoId}`) &&
-              data.thumbnail?.url?.includes(`i.ytimg.com/vi/${data.videoId}`)));
+          c.thumbnailUrl &&
+          coverUrl &&
+          (c.thumbnailUrl === coverUrl ||
+            c.thumbnailUrl.replace(/^https?:/, "") === coverUrl.replace(/^https?:/, ""));
         if (sameAsCover) {
           chapterImages.push(thumbnailVaultPath);
           continue;
